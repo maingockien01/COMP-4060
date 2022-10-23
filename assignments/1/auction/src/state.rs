@@ -1,6 +1,7 @@
 
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr};
+use cosmwasm_storage_plus::{Item, Map, List};
 
 #[cw_serde]
 pub struct Config {
@@ -42,3 +43,7 @@ pub struct Bid {
         pub buyer_id: Addr,
         pub price: f64
 }
+
+pub CONFIG: Item<Config> = Item::new("config");
+pub SELLERS: Map<&Addr, Seller> = Map::new("sellers");
+pub RESOURCES: List<Resource> = List::new("resources");
