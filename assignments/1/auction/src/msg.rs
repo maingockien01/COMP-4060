@@ -34,7 +34,7 @@ pub enum ExecuteMsg {
 pub enum QueryMsg {
 
     #[returns(QueryMeritResponse)]
-    QueryMerit {},
+    QueryResources {},
 
     #[returns(QueryResourceResponse)]
     QueryResource {
@@ -48,7 +48,7 @@ pub enum QueryMsg {
 }
 
 #[cw_serde]
-pub struct QueryMeritResponse {
+pub struct QueryResourcesResponse {
     pub resources: Vec<Resource>,
 }
 
