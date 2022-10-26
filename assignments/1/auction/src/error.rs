@@ -1,7 +1,7 @@
-use cosmwasm_std::StdError;
+use cosmwasm_std::{StdError, Coin};
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq)]
 pub enum ContractError {
     #[error("{0}")]
     Std(#[from] StdError),
@@ -29,5 +29,16 @@ pub enum ContractError {
     #[error("Resource Already Sold")]
     AlreadySold {},
 
+    #[error("Resource Has Expired")]
+    ResourceExpired {},
+
+    #[error("Coin is sent wrong")]
+    WrongCoinSent {},
+
+    #[error("Coin type is invalid")]
+    WrongFundCoin {
+        expected: String,
+        got: String,
+    },
 
 }

@@ -1,50 +1,58 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
 
+use crate::state::{Resource, Bid};
+
 #[cw_serde]
 pub struct InstantiateMsg {
-    pub ownder: Option<String>,
+    pub owner: Option<String>,
 }
 
 #[cw_serde]
 pub enum ExecuteMsg {
     NewResource {
         seller_id: Option<String>,
-        resource_id: Option<String>,
-        volume: f64,
-        price: f64,
+        volume: u64,
+        price: u64,
     },
 
     PlaceBid {
-        resource_id: String,
+        resource_id: u64,
         buyer_id: Option<String>,
-        price: f64,
+        price: u64,
     },
     
     CancelResource {
-        resource_id: String,
+        resource_id: u64,
     },
 
     StartBidding {
-        resource_id: String,
+        resource_id: u64,
     },
+
+    FinalizeBids {
+    },
+
+    FinalizeBid {
+        resource_id: u64,
+    }
 }
 
 #[cw_serde]
 #[derive(QueryResponses)]
 pub enum QueryMsg {
 
-    #[returns(QueryMeritResponse)]
+    #[returns(QueryResourcesResponse)]
     QueryResources {},
 
-    #[returns(QueryResourceResponse)]
-    QueryResource {
-        resource_id: String,
-    },
+    // #[returns(QueryResourceResponse)]
+    // QueryResource {
+    //     resource_id: String,
+    // },
 
-    #[returns(QueryBidsResponse)]
-    QueryBids {
-        resource_id: String,
-    },
+    // #[returns(QueryBidsResponse)]
+    // QueryBids {
+    //     resource_id: String,
+    // },
 }
 
 #[cw_serde]
@@ -52,15 +60,15 @@ pub struct QueryResourcesResponse {
     pub resources: Vec<Resource>,
 }
 
-#[cw_serde]
-pub struct QueryResourceResponse {
-    pub resource: Resource,
-    pub highest_bid: Option<Bid>,
-}
+// #[cw_serde]
+// pub struct QueryResourceResponse {
+//     pub resource: Resource,
+//     pub highest_bid: Option<Bid>,
+// }
 
-#[cw_serde]
-pub struct QueryBidsResponse {
-    pub bids: Vec<Bid>,
-}
+// #[cw_serde]
+// pub struct QueryBidsResponse {
+//     pub bids: Vec<Bid>,
+// }
 
 

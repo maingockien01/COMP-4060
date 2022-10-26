@@ -1,8 +1,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use cosmwasm_std::{to_binary, Addr, CosmosMsg, StdResult, WasmMsg};
+use cosmwasm_std::{to_binary, Addr, CosmosMsg, StdResult, WasmMsg, Coin};
 
+use crate::error::ContractError;
 use crate::msg::ExecuteMsg;
 
 /// CwTemplateContract is a wrapper around Addr that provides a lot of helpers
@@ -24,4 +25,17 @@ impl CwTemplateContract {
         }
         .into())
     }
+}
+
+pub fn extract_coin(sent_funds: &[Coin], denom: &str) -> Result<Coin, ContractError> {
+    if sent_funds.len() != 1 {
+        return Err(ContractError::WrongCoinSent {});
+    }
+    if sent_funds[0].denom != *denom {
+        return Err(ContractError::WrongFundCoin {
+            expected: denom.to_string(),
+            got: sent_funds[0].denom.clone(),
+        });
+    }
+    Ok(sent_funds[0].clone())
 }

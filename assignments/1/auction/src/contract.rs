@@ -1,13 +1,16 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
-use cosmwasm_std::{Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult};
+use cosmwasm_std::{Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, Order, to_binary, attr, from_binary, Timestamp, Uint128};
 use cw2::set_contract_version;
 
 use crate::error::ContractError;
-use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
-use crate::state::{Config, CONFIG, RESOURCES, CoinType};
+use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, QueryResourcesResponse};
+use crate::state::{Config, CONFIG, RESOURCES, CoinType, Status, BUYER_DEPOSIT_ACCOUNT, Resource, Bid, RESOURCE_ID};
+use crate::helpers::{extract_coin};
 
-use uuid::Uuid;
+use std::ops::Add;
+
+use std::cmp::Ordering;
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:auction";
@@ -21,17 +24,19 @@ pub fn instantiate(
     _info: MessageInfo,
     _msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+    set_contract_version(_deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
-    let ownder = msg.owner
-        .and_then(|address| deps.api.addr_validate(&address).ok())
-        .unwrap_or(info.sender);
+    let owner = _msg.owner
+        .and_then(|address| _deps.api.addr_validate(address.as_str()).ok())
+        .unwrap_or(_info.sender);
 
         let config = Config {
-            owner: owner.Clone(),
+            owner: owner.clone(),
         };
 
-        CONFIG.save(deps.storage, &config)?;
+        CONFIG.save(_deps.storage, &config)?;
+
+        RESOURCE_ID.save(_deps.storage, &0u64)?;
 
         Ok(Response::new().add_attribute("method", "instantiate")
             .add_attribute("owner", owner))
@@ -44,12 +49,12 @@ pub fn execute(
     _info: MessageInfo,
     _msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
-    match msg {
-        ExecuteMsg::NewResource { seller_id, resource_id, volume, price } => 
-            new_resource(_deps, _info, seller_id, resource_id, volume, price),
+    match _msg {
+        ExecuteMsg::NewResource { seller_id, volume, price } => 
+            new_resource(_deps, _env, _info, seller_id, volume, price),
         
         ExecuteMsg::PlaceBid { resource_id, buyer_id, price } => 
-            place_bid(_deps, _info, resource_id, buyer_id, price),
+            place_bid(_deps, _env, _info, resource_id, buyer_id, price),
         
         ExecuteMsg::CancelResource { resource_id } => 
             cancel_resource(_deps, _info, resource_id),
@@ -57,22 +62,34 @@ pub fn execute(
         ExecuteMsg::StartBidding { resource_id } => 
             start_bidding(_deps, _info, resource_id),
         
+        ExecuteMsg::FinalizeBids {} => 
+            finalize_bids(_deps, _env, _info),
+
+        ExecuteMsg::FinalizeBid { resource_id } => 
+            finalize_bid(_deps, _env, _info, resource_id),
     }
 }
 
-pub fn new_resource (deps: DepsMut, info: MessageInfo, seller_id: Option<String>, resource_id: Option<String>, volume: f64, price: f64) -> Result<Response, ContractError> {
+pub fn new_resource (deps: DepsMut, env: Env, info: MessageInfo, seller_id: Option<String>, volume: u64, price: u64) -> Result<Response, ContractError> {
     let seller_id = seller_id
         .and_then(|address| deps.api.addr_validate(&address).ok())
         .unwrap_or(info.sender);
 
-    let resource_id = RESOURCES.update::<_, cosmwasm_std::StdError>(deps.storage, | id | => Ok(id.add(1)))?;
+    let resource_id = RESOURCE_ID.update::<_, cosmwasm_std::StdError>(deps.storage, |id| Ok(id.add(1)))?;
+
+    let current_time = env.block.time;
+
+    let init_expire = current_time.clone().plus_seconds(60 * 60 * 24 * 3); //3 days
 
     let resource = Resource {
-        id: resource_id,
-        seller_id: seller_id,
+        resource_id: resource_id,
+        seller_id: seller_id.clone(),
         volume: volume,
         price: price,
         status: Status::Init,
+        highest_bid: None,
+        expire: init_expire,
+        bidders: vec![],
     };
         
     // Todo: Check if seller makes a security deposit
@@ -81,15 +98,18 @@ pub fn new_resource (deps: DepsMut, info: MessageInfo, seller_id: Option<String>
 
     Ok(Response::new().add_attribute("method", "new_resource")
         .add_attribute("seller_id", seller_id)
-        .add_attribute("resource_id", resource_id)
-        .add_attribute("volume", volume)
-        .add_attribute("price", price))
+        .add_attribute("resource_id", resource_id.to_string())
+        .add_attribute("volume", volume.to_string())
+        .add_attribute("price", price.to_string())
+        .add_attribute("expire", init_expire.seconds().to_string()))
 }
 
-pub fn place_bid (deps: DepsMut, info: MessageInfo, resource_id: Option<String>, buyer_id: Option<String>, price: f64) -> Result<Response, ContractError> {
+pub fn place_bid (deps: DepsMut, env: Env, info: MessageInfo, resource_id: u64, buyer_id: Option<String>, price: u64) -> Result<Response, ContractError> {
     let buyer_id = buyer_id
         .and_then(|address| deps.api.addr_validate(&address).ok())
         .unwrap_or(info.sender);
+
+    let current_time = env.block.time;
 
     let mut resource = RESOURCES.load(deps.storage, resource_id)?;
 
@@ -97,57 +117,71 @@ pub fn place_bid (deps: DepsMut, info: MessageInfo, resource_id: Option<String>,
         return Err(ContractError::NotBidding {});
     }
 
+    if buyer_id == resource.seller_id {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    if current_time.seconds() > resource.expire.seconds() {
+        return Err(ContractError::ResourceExpired{});
+    }
+
     let bid = Bid {
         buyer_id: buyer_id.clone(),
         price: price,
+        resource_id: resource_id,
     };
 
-    // Check if new bid is higher than current bid
-    if let Some(bids) = resource.bids {
-        if bids.len() > 0 {
-            let current_bid = bids.last().unwrap();
-            if current_bid.price >= price {
-                return Err(ContractError::BidTooLow {});
-            }
+    // // Check if new bid is higher than current bid
+    if resource.highest_bid != None {
+        let current_bid = resource.highest_bid.unwrap();
+        if current_bid.price >= price {
+            return Err(ContractError::BidTooLow {});
         }
     }
 
-    // Todo: updatre getting deposit using 2 indexes
-    let mut bid_deposit = BUYER_DEPOSITS.load(deps.storage, buyer_id)?;
-    let prev_deposit = bid_deposit?.deposit;
+    // Add new highest bid to resource
+    resource.highest_bid = Some(bid.clone());
 
-    //Check if buyer made a security deposit for the bid which is new amount with previous deposit
-    let deposit = info.funds.iter().find(|coin| coin.denom == CoinType.Native).unwrap();
-
-    let total = resouce.price * resource.volume;
+    // Extend expire time: extend to 1 hour if left time is less than 1 hours
+    if resource.expire.seconds() - current_time.seconds() < 3600 {
+        resource.expire = current_time.clone().plus_seconds(3600);
+    }
     
-    if deposit.amount + prev_deposit.amount < total {
-        return Err(ContractError::InsufficientDeposit {});
+    // Todo: handle money
+    // Get amount sent in the btransaction
+    let sent_deposit = extract_coin(&info.funds, "ucosm")?;
+
+    // Get amount in the current account
+    let current_deposit = BUYER_DEPOSIT_ACCOUNT.load(deps.storage, (buyer_id.clone(), resource_id));
+
+    let mut new_deposit = sent_deposit.clone();
+
+    if !current_deposit.is_err() {
+        new_deposit.amount += current_deposit.unwrap().amount;
     }
 
-    // Add new highest bid to resource
-    resource.bids.push(bid);
-    
-    // Update buyer deposit
-    bid_deposit.deposit.push(deposit);
+    // Check if amount is sufficient
 
-    // Todo: update new deposit
-    BUYER_DEPOSITS.save(deps.storage, buyer_id, , &bid_deposit)?;
+    if new_deposit.amount < Uint128::from(resource.price * resource.volume) {
+        return Err(ContractError::InsufficientDeposit{});
+    }
 
-    RESOURCES.save(deps.storage, resource_id.as_bytes(), &resource)?;
+    // Add amount into buyer-resource account with key of (buyer_id, resource_id)
+
+    if !resource.bidders.contains(&buyer_id) {
+        resource.bidders.push(buyer_id.clone());
+    }
+
+    RESOURCES.save(deps.storage, resource_id, &resource)?;
 
     Ok(Response::new().add_attribute("method", "place_bid")
         .add_attribute("buyer_id", buyer_id)
-        .add_attribute("resource_id", resource_id)
-        .add_attribute("price", price)
-        .add_attribute("refund", refund.len() == 0 ? "No" : "Yes")
-        .add_message(BankMsg::Send {
-            to_address: buyer_id,
-            refund,
-        })
+        .add_attribute("resource_id", resource_id.to_string())
+        .add_attribute("price", price.to_string())
+    )
 }
 
-pub fn cancel_resource (deps: DepsMut, info: MessageInfo, resource_id: String) -> Result<Response, ContractError> {
+pub fn cancel_resource (deps: DepsMut, info: MessageInfo, resource_id: u64)-> Result<Response, ContractError> {
     let mut resource = RESOURCES.load(deps.storage, resource_id)?;
 
     if resource.status == Status::Sold {
@@ -160,23 +194,23 @@ pub fn cancel_resource (deps: DepsMut, info: MessageInfo, resource_id: String) -
         return Err(ContractError::Unauthorized {});
     }
 
-    resource.status = Status::Cancelled;
+    resource.status = Status::Canceled;
 
-    RESOURCES.save(deps.storage, resource_id.as_bytes(), &resource)?;
+    RESOURCES.save(deps.storage, resource_id, &resource)?;
 
     // Todo: refund deposit to all bidders
 
     // Todo: refund deposit to seller
 
     Ok(Response::new().add_attribute("method", "cancel_resource")
-        .add_attribute("resource_id", resource_id))
+        .add_attribute("resource_id", resource_id.to_string()))
 }
 
-pub fn start_bidding (deps: DepsMut, info: MessageInfo, resource_id: Option<String>) -> Result<Response, ContractError> {
+pub fn start_bidding (deps: DepsMut, info: MessageInfo, resource_id: u64) -> Result<Response, ContractError> {
     
     let mut resource = RESOURCES.load(deps.storage, resource_id)?;
     
-    if info.sender != resouce.seller_id {
+    if info.sender != resource.seller_id {
         return Err(ContractError::Unauthorized {});
     }
     
@@ -186,27 +220,69 @@ pub fn start_bidding (deps: DepsMut, info: MessageInfo, resource_id: Option<Stri
 
     resource.status = Status::Bidding;
 
-    RESOURCES.save(deps.storage, resource_id.as_bytes(), &resource)?;
+    RESOURCES.save(deps.storage, resource.resource_id, &resource)?;
 
     Ok(Response::new().add_attribute("method", "start_bidding")
-        .add_attribute("resource_id", resource_id))
+        .add_attribute("resource_id", resource_id.to_string()))
+}
+
+pub fn finalize_bids (deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, ContractError> {
+
+    let config = CONFIG.load(deps.storage)?;
+
+    if info.sender != config.owner {
+        return Err(ContractError::Unauthorized{});
+    }
+
+    let current_time = env.block.time;
+
+    let resources = RESOURCES.range(deps.storage, None, None, Order::Ascending).map(|item| item.map(|(_, v)| v))
+    .collect::<StdResult<Vec<Resource>>>()?;
+
+    todo!();
+
+    Ok(Response::new().add_attribute("method", "finalize_bids"))
+}
+
+pub fn finalize_bid (deps: DepsMut, env: Env, info: MessageInfo, resource_id: u64) -> Result<Response, ContractError> {
+    todo!();
+
+    //Get resource
+    
+    //Get bank account
+
+    //Refund all bidders except highest bidder -> final buyer
+
+    //Change status to sold
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(_deps: Deps, _env: Env, _msg: QueryMsg) -> StdResult<Binary> {
-    match msg {
-        QueryMsg::QueryResources {} => to_binary(&query_resources(_deps)?),
+    match _msg {
+        QueryMsg::QueryResources {} => query_resources(_deps),
     }
 }
 
-pub fn query_resources (deps: Deps) -> StdResult<Vec<Resource>> {
+pub fn query_resources (deps: Deps) -> StdResult<Binary> {
     let resources = RESOURCES
         .range(deps.storage, None, None, Order::Ascending)
         .map(|item| item.map(|(_, v)| v))
-        .collect::<StdResult<Vec<Resource>>>()?
-        .sort_by(|a, b| a.price.cmp(&b.price));
+        .collect::<StdResult<Vec<Resource>>>()?;
 
-    Ok(resources)
+    let mut sorted_resources = resources.clone();
+    sorted_resources.sort_by(|a, b| {
+        if a.price < b.price {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    });
+
+    let resp = QueryResourcesResponse {
+        resources: sorted_resources
+    };
+
+    to_binary(&resp)
 }
 
 #[cfg(test)]
@@ -216,59 +292,390 @@ mod tests {
     use cosmwasm_std::{coins, from_binary, Addr, Coin, CosmosMsg, StdError, Uint128};
 
     #[test]
-    fn test_new_resource() {
-        let mut deps = mock_dependencies(&[]);
+    fn proper_initialization() {
+        let mut deps = mock_dependencies();
+        //no owner specified in the instantiation message
+        let msg = InstantiateMsg { owner: None };
+        let env = mock_env();
+        let info = mock_info("creator", &[]);
 
-        let info = mock_info("addr0000", &coins(2, "token"));
-
-        let msg = ExecuteMsg::NewResource {
-            seller_id: None,
-            resource_id: None,
-            volume: 100.0,
-            price: 1.0,
-        };
-
-        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
+        let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
         assert_eq!(0, res.messages.len());
 
         // it worked, let's query the state
-        let res = query(deps.as_ref(), mock_env(), QueryMsg::QueryResources {}).unwrap();
-        let value: Vec<Resource> = from_binary(&res).unwrap();
-        assert_eq!(1, value.len());
-        assert_eq!("addr0000", value[0].seller_id.as_str());
-        assert_eq!(100.0, value[0].volume);
-        assert_eq!(1.0, value[0].price);
+        let state = CONFIG.load(&deps.storage).unwrap();
+        assert_eq!(
+            state,
+            Config {
+                owner: Addr::unchecked("creator".to_string()),
+            }
+        );
+        //specifying an owner address in the instantiation message
+        let msg = InstantiateMsg {
+            owner: Some("specified_owner".to_string()),
+        };
+
+        let res = instantiate(deps.as_mut(), env, info, msg).unwrap();
+        assert_eq!(0, res.messages.len());
+
+        // it worked, let's query the state
+        let state = CONFIG.load(&deps.storage).unwrap();
+        assert_eq!(
+            state,
+            Config {
+                owner: Addr::unchecked("specified_owner".to_string()),
+            }
+        );
+    }
+
+
+    #[test]
+    fn test_new_resource() {
+        let mut deps = mock_dependencies();
+        //no owner specified in the instantiation message
+        let msg = InstantiateMsg { owner: None };
+        let env = mock_env();
+        let info = mock_info("creator", &[]);
+
+        let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
+
+        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let msg = ExecuteMsg::NewResource {
+            seller_id: None,
+            volume: 100,
+            price: 1,
+        };
+        let mut env = mock_env();
+
+        env.block.time = Timestamp::from_seconds(0);
+
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "new_resource"),
+                attr("seller_id", "addr0000"),
+                attr("resource_id", "1"),
+                attr("volume", "100"),
+                attr("price", "1"),
+                attr("expire", "259200"),
+
+            ]
+        );
+    }
+
+    #[test]
+    fn test_start_bidding() {
+        let mut deps = mock_dependencies();
+        //no owner specified in the instantiation message
+        let msg = InstantiateMsg { owner: None };
+        let env = mock_env();
+        let info = mock_info("creator", &[]);
+
+        let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
+
+        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let msg = ExecuteMsg::NewResource {
+            seller_id: None,
+            volume: 100,
+            price: 1,
+        };
+
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        
+
+        // Start bid with different address of seller
+        let info = mock_info("addr0001", &coins(2, "ucosm"));
+        let msg = ExecuteMsg::StartBidding {
+            resource_id: 1,
+        };
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+        assert_eq!(res.map_err(|e| e), Err(ContractError::Unauthorized{}));
+        
+        // Start bid with correct addres
+        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let msg = ExecuteMsg::StartBidding {
+            resource_id: 1,
+        };
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "start_bidding"),
+                attr("resource_id", "1")
+
+            ]
+        );
     }
 
     #[test]
     fn test_place_bid() {
-        // let mut deps = mock_dependencies(&[]);
+        let mut deps = mock_dependencies();
+        //no owner specified in the instantiation message
+        let msg = InstantiateMsg { owner: None };
+        let env = mock_env();
+        let info = mock_info("creator", &[]);
 
-        // let info = mock_info("addr0000", &coins(2, "token"));
+        let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
 
-        // let msg = ExecuteMsg::NewResource {
-        //     seller_id: None,
-        //     resource_id: None,
-        //     volume: 100.0,
-        //     price: 1.0,
-        // };
+        // Create new resource
+        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let msg = ExecuteMsg::NewResource {
+            seller_id: None,
+            volume: 100,
+            price: 1,
+        };
+        let init_time = 0;
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time);
 
-        // let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
-        // assert_eq!(0, res.messages.len());
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
 
-        // // it worked, let's query the state
-        // let res = query(deps.as_ref(), mock_env(), QueryMsg::Resources {}).unwrap();
-        // let value: Vec<Resource> = from_binary(&res).unwrap();
-        // assert_eq!(1, value.len());
-        // assert_eq!("addr0000", value[0].seller_id.as_str());
-        // assert_eq!(100.0, value[0].volume);
-        // assert_eq!(1.0, value[0].price);
+        // Place bid - Should be error since bid has not started yet
+        let info = mock_info("addr0002", &coins(2, "ucosm"));
+        let msg = ExecuteMsg::PlaceBid {
+            resource_id: 1,
+            buyer_id: None,
+            price: 2,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 1);
 
-        // let info = mock_info("addr0001", &coins(2, "token"));
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+        assert!(res.is_err());
+        
+        // Start bid - Change status of resource to bidding
+        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let msg = ExecuteMsg::StartBidding {
+            resource_id: 1,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 1);
+        
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "start_bidding"),
+                attr("resource_id", "1")
 
-        // let msg = ExecuteMsg::PlaceBid {
-        //     resource_id
-        //     buyer_id: None,
-        //     price: 1.0,
-        // }
+            ]
+        );
+
+        // Place bid should be success
+        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let msg = ExecuteMsg::PlaceBid {
+            resource_id: 1,
+            buyer_id: None,
+            price: 2,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 1);
+        
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "place_bid"),
+                attr("buyer_id", "addr0002"),
+                attr("resource_id", "1"),
+                attr("price", "2")
+            ]
+        );
+
+        // Place bid after expire - Should be fail
+        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let msg = ExecuteMsg::PlaceBid {
+            resource_id: 1,
+            buyer_id: None,
+            price: 2,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 259200 + 1);
+        
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+        assert_eq!(res.map_err(|e| e), Err(ContractError::ResourceExpired {}));
+
+
+        // Place bid - invalid resource id - should be fail
+        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let msg = ExecuteMsg::PlaceBid {
+            resource_id: 2,
+            buyer_id: None,
+            price: 2,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 1);
+        
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+        assert_eq!(res.is_err(), true);
+
+        // Place bid low price - should be fail
+
+        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let msg = ExecuteMsg::PlaceBid {
+            resource_id: 1,
+            buyer_id: None,
+            price: 1,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 1);
+        
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+
+        assert_eq!(res.map_err(|e| e), Err(ContractError::BidTooLow {}));
+
+        // Place bid insufficient amount should fail
+        let info = mock_info("addr0003", &coins(1, "ucosm"));
+        let msg = ExecuteMsg::PlaceBid {
+            resource_id: 1,
+            buyer_id: None,
+            price: 3,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 1);
+        
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+        assert_eq!(res.map_err(|e| e), Err(ContractError::InsufficientDeposit {}));
+
+    }
+
+
+    #[test]
+    fn test_place_bid_add_up_deposit() {
+        let mut deps = mock_dependencies();
+        //no owner specified in the instantiation message
+        let msg = InstantiateMsg { owner: None };
+        let env = mock_env();
+        let info = mock_info("creator", &[]);
+
+        let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
+
+        // Create new resource
+        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let msg = ExecuteMsg::NewResource {
+            seller_id: None,
+            volume: 100,
+            price: 1,
+        };
+        let init_time = 0;
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time);
+
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+
+        // Start bid - Change status of resource to bidding
+        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let msg = ExecuteMsg::StartBidding {
+            resource_id: 1,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 1);
+        
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+
+        // Place bid should be success
+        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let msg = ExecuteMsg::PlaceBid {
+            resource_id: 1,
+            buyer_id: None,
+            price: 2,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 1);
+        
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "place_bid"),
+                attr("buyer_id", "addr0002"),
+                attr("resource_id", "1"),
+                attr("price", "2")
+            ]
+        );
+
+        // Place bid should be success
+        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let msg = ExecuteMsg::PlaceBid {
+            resource_id: 1,
+            buyer_id: None,
+            price: 4,
+        };
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(init_time + 1);
+        
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
+        assert_eq!(
+            res.attributes,
+            vec![
+                attr("method", "place_bid"),
+                attr("buyer_id", "addr0002"),
+                attr("resource_id", "1"),
+                attr("price", "4")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_query_resources() {
+        let mut deps = mock_dependencies();
+        //no owner specified in the instantiation message
+        let msg = InstantiateMsg { owner: None };
+        let env = mock_env();
+        let info = mock_info("creator", &[]);
+
+        let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        assert_eq!(0, res.messages.len());
+
+        let info = mock_info("addr0000", &coins(2, "token"));
+        let msg = ExecuteMsg::NewResource {
+            seller_id: None,
+            volume: 100,
+            price: 1,
+        };
+
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        
+        let info = mock_info("addr0001", &coins(2, "token"));
+        let msg = ExecuteMsg::NewResource {
+            seller_id: None,
+            volume: 100,
+            price: 3,
+        };
+
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+
+        let info = mock_info("addr0002", &coins(2, "token"));
+        let msg = ExecuteMsg::NewResource {
+            seller_id: None,
+            volume: 100,
+            price: 2,
+        };
+
+        let _res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+
+        let res = query(deps.as_ref(), env.clone(), QueryMsg::QueryResources{}).unwrap();
+
+        let value: QueryResourcesResponse = from_binary(&res).unwrap();
+        // Test length
+        assert_eq!(value.resources.len(), 3);
+        // Test orders
+        assert_eq!(value.resources[0].price, 1);
+        assert_eq!(value.resources[1].price, 2);
+        assert_eq!(value.resources[2].price, 3);
+
+    }
+
+    #[test]
+    fn test_place_bid_extend_expire() {
+        todo!();
+    }
 }
