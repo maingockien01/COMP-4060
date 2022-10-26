@@ -6,6 +6,7 @@ use cw_storage_plus::{Item, Map};
 #[cw_serde]
 pub struct Config {
         pub owner: Addr,
+        pub denom: String,
 }
 
 #[cw_serde]
@@ -26,6 +27,7 @@ pub enum Status {
         Bidding,
         Sold,
         Canceled,
+        Approved,
         Transfered,
 }
 
@@ -41,14 +43,6 @@ pub struct ResourceDeposit {
         pub resource_id: u64,
         pub deposit: Coin,
         pub seller_id: Addr,
-}
-
-
-#[cw_serde]
-pub enum CoinType {
-        Native,
-        Usd,
-        Cad,
 }
 
 pub const CONFIG: Item<Config> = Item::new("config");

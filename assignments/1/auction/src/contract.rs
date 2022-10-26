@@ -1,11 +1,14 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
-use cosmwasm_std::{Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, Order, to_binary, attr, from_binary, Timestamp, Uint128};
+use cosmwasm_std::{
+    Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, Order, 
+    to_binary, attr, from_binary, Timestamp, Uint128,
+    CosmosMsg, BankMsg};
 use cw2::set_contract_version;
 
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg, QueryResourcesResponse};
-use crate::state::{Config, CONFIG, RESOURCES, CoinType, Status, BUYER_DEPOSIT_ACCOUNT, Resource, Bid, RESOURCE_ID};
+use crate::state::{Config, CONFIG, RESOURCES, Status, BUYER_DEPOSIT_ACCOUNT, Resource, Bid, RESOURCE_ID};
 use crate::helpers::{extract_coin};
 
 use std::ops::Add;
@@ -32,6 +35,7 @@ pub fn instantiate(
 
         let config = Config {
             owner: owner.clone(),
+            denom: _msg.denom,
         };
 
         CONFIG.save(_deps.storage, &config)?;
@@ -149,7 +153,8 @@ pub fn place_bid (deps: DepsMut, env: Env, info: MessageInfo, resource_id: u64, 
     
     // Todo: handle money
     // Get amount sent in the btransaction
-    let sent_deposit = extract_coin(&info.funds, "ucosm")?;
+    let config = CONFIG.load(deps.storage)?;
+    let sent_deposit = extract_coin(&info.funds, &config.denom)?;
 
     // Get amount in the current account
     let current_deposit = BUYER_DEPOSIT_ACCOUNT.load(deps.storage, (buyer_id.clone(), resource_id));
@@ -245,15 +250,60 @@ pub fn finalize_bids (deps: DepsMut, env: Env, info: MessageInfo) -> Result<Resp
 }
 
 pub fn finalize_bid (deps: DepsMut, env: Env, info: MessageInfo, resource_id: u64) -> Result<Response, ContractError> {
-    todo!();
 
-    //Get resource
+    let config = CONFIG.load(deps.storage)?;
     
+    if info.sender != config.owner {
+        return Err(ContractError::Unauthorized{});
+    }
+
+    let current_time = env.block.time;
+    let mut resource = RESOURCES.load(deps.storage, resource_id)?;
+
+    if current_time.seconds() < resource.expire.seconds() {
+        return Err(ContractError::NotExpire{});
+    }
+
+    if resource.status != Status::Bidding {
+        return Err(ContractError::NotBidding{});
+    }
+    let mut refund_msg = vec![];
+
     //Get bank account
+    if !resource.clone().highest_bid.is_none() {
+        
+        let highest_bid = resource.highest_bid.clone().unwrap();
 
-    //Refund all bidders except highest bidder -> final buyer
+        let highest_bidder = highest_bid.buyer_id;
 
+        //Refund all bidders except highest bidder -> final buyer
+        let mut bidders = resource.clone().bidders;
+
+
+        for bidder in bidders {
+            if bidder != highest_bidder {
+                let deposit = BUYER_DEPOSIT_ACCOUNT.load(deps.storage, (bidder.clone(), resource.resource_id));
+                if deposit.is_ok() {
+                    let deposit_amount = deposit.unwrap();
+
+                    refund_msg.push(CosmosMsg::Bank(BankMsg::Send{
+                        to_address: bidder.to_string(),
+                        amount: vec![deposit_amount],
+                    }));
+                }
+            }
+        }
+    }
     //Change status to sold
+
+    resource.status = Status::Sold;
+
+    RESOURCES.save(deps.storage, resource.resource_id, &resource)?;
+
+    Ok(Response::new()
+        .add_messages(refund_msg)
+        .add_attribute("method", "finalize_bid")
+        .add_attribute("resource", resource_id.to_string()))
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -291,11 +341,15 @@ mod tests {
     use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
     use cosmwasm_std::{coins, from_binary, Addr, Coin, CosmosMsg, StdError, Uint128};
 
+    fn proper_instantiate() {
+
+    }
+
     #[test]
     fn proper_initialization() {
         let mut deps = mock_dependencies();
         //no owner specified in the instantiation message
-        let msg = InstantiateMsg { owner: None };
+        let msg = InstantiateMsg { owner: None, denom: String::from("umgl") };
         let env = mock_env();
         let info = mock_info("creator", &[]);
 
@@ -308,11 +362,13 @@ mod tests {
             state,
             Config {
                 owner: Addr::unchecked("creator".to_string()),
+                denom: String::from("umgl"),
             }
         );
         //specifying an owner address in the instantiation message
         let msg = InstantiateMsg {
             owner: Some("specified_owner".to_string()),
+            denom: String::from("umgl"),
         };
 
         let res = instantiate(deps.as_mut(), env, info, msg).unwrap();
@@ -324,6 +380,7 @@ mod tests {
             state,
             Config {
                 owner: Addr::unchecked("specified_owner".to_string()),
+                denom: String::from("umgl"),
             }
         );
     }
@@ -333,14 +390,14 @@ mod tests {
     fn test_new_resource() {
         let mut deps = mock_dependencies();
         //no owner specified in the instantiation message
-        let msg = InstantiateMsg { owner: None };
+        let msg = InstantiateMsg { owner: None, denom: String::from("umgl") };
         let env = mock_env();
         let info = mock_info("creator", &[]);
 
         let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
         assert_eq!(0, res.messages.len());
 
-        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let info = mock_info("addr0000", &coins(2, "umgl"));
         let msg = ExecuteMsg::NewResource {
             seller_id: None,
             volume: 100,
@@ -369,14 +426,14 @@ mod tests {
     fn test_start_bidding() {
         let mut deps = mock_dependencies();
         //no owner specified in the instantiation message
-        let msg = InstantiateMsg { owner: None };
+        let msg = InstantiateMsg { owner: None, denom: String::from("umgl") };
         let env = mock_env();
         let info = mock_info("creator", &[]);
 
         let res = instantiate(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
         assert_eq!(0, res.messages.len());
 
-        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let info = mock_info("addr0000", &coins(2, "umgl"));
         let msg = ExecuteMsg::NewResource {
             seller_id: None,
             volume: 100,
@@ -387,7 +444,7 @@ mod tests {
         
 
         // Start bid with different address of seller
-        let info = mock_info("addr0001", &coins(2, "ucosm"));
+        let info = mock_info("addr0001", &coins(2, "umgl"));
         let msg = ExecuteMsg::StartBidding {
             resource_id: 1,
         };
@@ -395,7 +452,7 @@ mod tests {
         assert_eq!(res.map_err(|e| e), Err(ContractError::Unauthorized{}));
         
         // Start bid with correct addres
-        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let info = mock_info("addr0000", &coins(2, "umgl"));
         let msg = ExecuteMsg::StartBidding {
             resource_id: 1,
         };
@@ -414,7 +471,7 @@ mod tests {
     fn test_place_bid() {
         let mut deps = mock_dependencies();
         //no owner specified in the instantiation message
-        let msg = InstantiateMsg { owner: None };
+        let msg = InstantiateMsg { owner: None, denom: String::from("umgl") };
         let env = mock_env();
         let info = mock_info("creator", &[]);
 
@@ -422,7 +479,7 @@ mod tests {
         assert_eq!(0, res.messages.len());
 
         // Create new resource
-        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let info = mock_info("addr0000", &coins(2, "umgl"));
         let msg = ExecuteMsg::NewResource {
             seller_id: None,
             volume: 100,
@@ -435,7 +492,7 @@ mod tests {
         let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
 
         // Place bid - Should be error since bid has not started yet
-        let info = mock_info("addr0002", &coins(2, "ucosm"));
+        let info = mock_info("addr0002", &coins(2, "umgl"));
         let msg = ExecuteMsg::PlaceBid {
             resource_id: 1,
             buyer_id: None,
@@ -448,7 +505,7 @@ mod tests {
         assert!(res.is_err());
         
         // Start bid - Change status of resource to bidding
-        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let info = mock_info("addr0000", &coins(2, "umgl"));
         let msg = ExecuteMsg::StartBidding {
             resource_id: 1,
         };
@@ -466,7 +523,7 @@ mod tests {
         );
 
         // Place bid should be success
-        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let info = mock_info("addr0002", &coins(200, "umgl"));
         let msg = ExecuteMsg::PlaceBid {
             resource_id: 1,
             buyer_id: None,
@@ -488,7 +545,7 @@ mod tests {
         );
 
         // Place bid after expire - Should be fail
-        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let info = mock_info("addr0002", &coins(200, "umgl"));
         let msg = ExecuteMsg::PlaceBid {
             resource_id: 1,
             buyer_id: None,
@@ -502,7 +559,7 @@ mod tests {
 
 
         // Place bid - invalid resource id - should be fail
-        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let info = mock_info("addr0002", &coins(200, "umgl"));
         let msg = ExecuteMsg::PlaceBid {
             resource_id: 2,
             buyer_id: None,
@@ -516,7 +573,7 @@ mod tests {
 
         // Place bid low price - should be fail
 
-        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let info = mock_info("addr0002", &coins(200, "umgl"));
         let msg = ExecuteMsg::PlaceBid {
             resource_id: 1,
             buyer_id: None,
@@ -530,7 +587,7 @@ mod tests {
         assert_eq!(res.map_err(|e| e), Err(ContractError::BidTooLow {}));
 
         // Place bid insufficient amount should fail
-        let info = mock_info("addr0003", &coins(1, "ucosm"));
+        let info = mock_info("addr0003", &coins(1, "umgl"));
         let msg = ExecuteMsg::PlaceBid {
             resource_id: 1,
             buyer_id: None,
@@ -549,7 +606,7 @@ mod tests {
     fn test_place_bid_add_up_deposit() {
         let mut deps = mock_dependencies();
         //no owner specified in the instantiation message
-        let msg = InstantiateMsg { owner: None };
+        let msg = InstantiateMsg { owner: None, denom: String::from("umgl") };
         let env = mock_env();
         let info = mock_info("creator", &[]);
 
@@ -557,7 +614,7 @@ mod tests {
         assert_eq!(0, res.messages.len());
 
         // Create new resource
-        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let info = mock_info("addr0000", &coins(2, "umgl"));
         let msg = ExecuteMsg::NewResource {
             seller_id: None,
             volume: 100,
@@ -570,7 +627,7 @@ mod tests {
         let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
 
         // Start bid - Change status of resource to bidding
-        let info = mock_info("addr0000", &coins(2, "ucosm"));
+        let info = mock_info("addr0000", &coins(2, "umgl"));
         let msg = ExecuteMsg::StartBidding {
             resource_id: 1,
         };
@@ -580,7 +637,7 @@ mod tests {
         let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
 
         // Place bid should be success
-        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let info = mock_info("addr0002", &coins(200, "umgl"));
         let msg = ExecuteMsg::PlaceBid {
             resource_id: 1,
             buyer_id: None,
@@ -602,7 +659,7 @@ mod tests {
         );
 
         // Place bid should be success
-        let info = mock_info("addr0002", &coins(200, "ucosm"));
+        let info = mock_info("addr0002", &coins(200, "umgl"));
         let msg = ExecuteMsg::PlaceBid {
             resource_id: 1,
             buyer_id: None,
@@ -628,7 +685,7 @@ mod tests {
     fn test_query_resources() {
         let mut deps = mock_dependencies();
         //no owner specified in the instantiation message
-        let msg = InstantiateMsg { owner: None };
+        let msg = InstantiateMsg { owner: None, denom: String::from("umgl") };
         let env = mock_env();
         let info = mock_info("creator", &[]);
 

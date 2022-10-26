@@ -5,6 +5,7 @@ use crate::state::{Resource, Bid};
 #[cw_serde]
 pub struct InstantiateMsg {
     pub owner: Option<String>,
+    pub denom: String,
 }
 
 #[cw_serde]
@@ -34,7 +35,20 @@ pub enum ExecuteMsg {
 
     FinalizeBid {
         resource_id: u64,
-    }
+    },
+
+    // WithdrawExpiredResources {
+    //     resouce_id: String,
+    // },
+
+    // ApproveResource {
+    //     resouce_id: String,
+    // },
+
+    // TransferDeposit {
+    //     resouce_id: String
+    // }
+
 }
 
 #[cw_serde]

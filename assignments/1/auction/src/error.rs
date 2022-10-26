@@ -41,4 +41,8 @@ pub enum ContractError {
         got: String,
     },
 
+    #[error("Resource is still available for bidding")]
+    NotExpire {
+
+    },
 }
